@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-投资仪表盘 - Render 部署版
-使用持久化 SQLite 文件数据库，数据不会因重启丢失
+投资仪表盘 - Supabase PostgreSQL 版
+数据存储在云端 Supabase 数据库，重启不会丢失
 """
 
 import os
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -23,19 +24,21 @@ BLUE = "#3498DB"
 ORANGE = "#F39C12"
 PURPLE = "#9B59B6"
 
-# 数据库路径（Render 持久化磁盘在 /opt/render/project/src 下）
-DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "investment.db")
+# ─── 数据库配置（从环境变量读取）───────────────────────────
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/postgres"
+)
 
-# ─── 建表 SQL ───────────────────────────────────────────
+
+# ─── 建表 SQL（PostgreSQL 语法）───────────────────────────
 TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS stocks (
     ts_code TEXT PRIMARY KEY, name TEXT, industry TEXT, market TEXT,
-    list_date TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    list_date TEXT, updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS daily (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, ts_code TEXT NOT NULL,
+    id SERIAL PRIMARY KEY, ts_code TEXT NOT NULL,
     trade_date TEXT NOT NULL, open REAL DEFAULT 0, high REAL DEFAULT 0,
     low REAL DEFAULT 0, close REAL DEFAULT 0, volume REAL DEFAULT 0,
     amount REAL DEFAULT 0, pct_chg REAL DEFAULT 0, turnover REAL DEFAULT 0,
@@ -44,20 +47,20 @@ CREATE TABLE IF NOT EXISTS daily (
 CREATE TABLE IF NOT EXISTS positions (
     ts_code TEXT PRIMARY KEY, shares REAL NOT NULL, cost_price REAL NOT NULL,
     current_price REAL DEFAULT 0, buy_date TEXT, notes TEXT,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, ts_code TEXT NOT NULL,
+    id SERIAL PRIMARY KEY, ts_code TEXT NOT NULL,
     direction TEXT NOT NULL, price REAL NOT NULL, shares REAL NOT NULL,
     trade_date TEXT, fee REAL DEFAULT 0, notes TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS watchlist (
     ts_code TEXT PRIMARY KEY, group_name TEXT DEFAULT '默认',
-    notes TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP
+    notes TEXT, added_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS financials (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, ts_code TEXT NOT NULL,
+    id SERIAL PRIMARY KEY, ts_code TEXT NOT NULL,
     period TEXT NOT NULL, end_date TEXT, revenue REAL DEFAULT 0,
     net_profit REAL DEFAULT 0, gross_margin REAL DEFAULT 0,
     roe REAL DEFAULT 0, pe REAL DEFAULT 0, pb REAL DEFAULT 0,
@@ -65,21 +68,26 @@ CREATE TABLE IF NOT EXISTS financials (
 );
 CREATE TABLE IF NOT EXISTS briefings (
     trade_date TEXT PRIMARY KEY, summary TEXT, market_view TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
 
 
+def get_connection():
+    """获取数据库连接"""
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
 def init_db():
     """初始化数据库，如果是首次则写入演示数据"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(TABLES_SQL)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(TABLES_SQL)
     conn.commit()
 
     # 检查是否已有数据
-    count = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+    cur.execute("SELECT COUNT(*) AS cnt FROM stocks")
+    count = cur.fetchone()["cnt"]
     if count == 0:
         _seed_demo_data(conn)
 
@@ -88,6 +96,7 @@ def init_db():
 
 def _seed_demo_data(conn):
     """首次启动时写入演示数据"""
+    cur = conn.cursor()
     portfolio = [
         ("00700.HK", "腾讯控股", "互联网", "HK"),
         ("600519.SH", "贵州茅台", "白酒", "SH"),
@@ -99,9 +108,9 @@ def _seed_demo_data(conn):
         ("300144.SZ", "宋城演艺", "文旅", "SZ"),
     ]
     for ts_code, name, industry, market in portfolio:
-        conn.execute(
-            "INSERT OR REPLACE INTO stocks (ts_code, name, industry, market) VALUES (?, ?, ?, ?)",
-            (ts_code, name, industry, market)
+        cur.execute(
+            "INSERT INTO stocks (ts_code, name, industry, market) VALUES (%s, %s, %s, %s) ON CONFLICT (ts_code) DO UPDATE SET name=%s, industry=%s, market=%s",
+            (ts_code, name, industry, market, name, industry, market)
         )
 
     positions = [
@@ -115,10 +124,12 @@ def _seed_demo_data(conn):
         ("300144.SZ", 3000, 12.50, 11.80, "2025-03-18", "文旅复苏"),
     ]
     for ts_code, shares, cost, current, buy_date, notes in positions:
-        conn.execute(
-            """INSERT OR REPLACE INTO positions (ts_code, shares, cost_price, current_price, buy_date, notes, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (ts_code, shares, cost, current, buy_date, notes, datetime.now().isoformat())
+        cur.execute(
+            """INSERT INTO positions (ts_code, shares, cost_price, current_price, buy_date, notes, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (ts_code) DO UPDATE SET shares=%s, cost_price=%s, current_price=%s, buy_date=%s, notes=%s, updated_at=%s""",
+            (ts_code, shares, cost, current, buy_date, notes, datetime.now().isoformat(),
+             shares, cost, current, buy_date, notes, datetime.now().isoformat())
         )
 
     # 模拟行情数据
@@ -143,10 +154,12 @@ def _seed_demo_data(conn):
             low_p = round(min(open_p, close_p) * (1 - random.uniform(0, 0.015)), 2)
             volume = round(random.uniform(50000, 500000), 0)
             pct = round((close_p - (price / (1 + change))) / (price / (1 + change)) * 100, 2) if change != 0 else 0
-            conn.execute(
-                """INSERT OR REPLACE INTO daily (ts_code, trade_date, open, high, low, close, volume, pct_chg)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (ts_code, d.strftime("%Y%m%d"), open_p, high_p, low_p, close_p, volume, pct)
+            cur.execute(
+                """INSERT INTO daily (ts_code, trade_date, open, high, low, close, volume, pct_chg)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (ts_code, trade_date) DO UPDATE SET open=%s, high=%s, low=%s, close=%s, volume=%s, pct_chg=%s""",
+                (ts_code, d.strftime("%Y%m%d"), open_p, high_p, low_p, close_p, volume, pct,
+                 open_p, high_p, low_p, close_p, volume, pct)
             )
 
     demo_trades = [
@@ -157,9 +170,9 @@ def _seed_demo_data(conn):
         ("000333.SZ", "buy", 58.00, 1000, "2025-01-22", 25.0, "买入"),
     ]
     for ts_code, d, p, s, tdate, fee, notes in demo_trades:
-        conn.execute(
+        cur.execute(
             """INSERT INTO trades (ts_code, direction, price, shares, trade_date, fee, notes, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
             (ts_code, d, p, s, tdate, fee, notes, datetime.now().isoformat())
         )
 
@@ -169,9 +182,9 @@ def _seed_demo_data(conn):
         ("002475.SZ", "新能源", "长期关注"),
     ]
     for ts_code, group, notes in watchlist:
-        conn.execute(
-            "INSERT OR REPLACE INTO watchlist (ts_code, group_name, notes, added_at) VALUES (?, ?, ?, ?)",
-            (ts_code, group, notes, datetime.now().isoformat())
+        cur.execute(
+            "INSERT INTO watchlist (ts_code, group_name, notes, added_at) VALUES (%s, %s, %s, %s) ON CONFLICT (ts_code) DO UPDATE SET group_name=%s, notes=%s, added_at=%s",
+            (ts_code, group, notes, datetime.now().isoformat(), group, notes, datetime.now().isoformat())
         )
 
     conn.commit()
@@ -179,18 +192,49 @@ def _seed_demo_data(conn):
 
 # ─── 查询封装 ─────────────────────────────────────────
 def query_df(sql, params=None):
-    return pd.read_sql_query(sql, conn, params=params)
+    """执行查询，返回 pandas DataFrame"""
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+        return df
+    finally:
+        conn.close()
 
-def query_rows(sql, params=None):
-    return conn.execute(sql, params or ()).fetchall()
+
+def execute_sql(sql, params=None):
+    """执行写入操作（INSERT/UPDATE/DELETE）"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params or ())
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def query_one(sql, params=None):
+    """查询单个值"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params or ())
+        row = cur.fetchone()
+        return row
+    finally:
+        conn.close()
 
 
 # ─── 初始化 ──────────────────────────────────────────
 @st.cache_resource
-def get_conn():
-    return init_db()
+def init_app():
+    """初始化数据库并返回状态"""
+    conn = init_db()
+    conn.close()
+    return True
 
-conn = get_conn()
+init_app()
+
 
 # ─── 侧边栏：数据管理 ────────────────────────────────
 with st.sidebar:
@@ -208,11 +252,10 @@ with st.sidebar:
                 market = st.selectbox("市场", ["SH", "SZ", "HK", "US"])
                 submitted = st.form_submit_button("添加")
                 if submitted and ts_code and name:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO stocks (ts_code, name, industry, market) VALUES (?, ?, ?, ?)",
-                        (ts_code, name, industry, market)
+                    execute_sql(
+                        "INSERT INTO stocks (ts_code, name, industry, market) VALUES (%s, %s, %s, %s) ON CONFLICT (ts_code) DO UPDATE SET name=%s, industry=%s, market=%s",
+                        (ts_code, name, industry, market, name, industry, market)
                     )
-                    conn.commit()
                     st.success(f"{name} 已添加")
                     st.rerun()
 
@@ -225,8 +268,7 @@ with st.sidebar:
         with st.expander("删除股票"):
             del_code = st.selectbox("选择要删除的", stocks_df["ts_code"].tolist(), key="del_stock")
             if st.button("确认删除", type="secondary"):
-                conn.execute("DELETE FROM stocks WHERE ts_code=?", (del_code,))
-                conn.commit()
+                execute_sql("DELETE FROM stocks WHERE ts_code=%s", (del_code,))
                 st.success("已删除")
                 st.rerun()
 
@@ -243,23 +285,23 @@ with st.sidebar:
                 notes = st.text_input("备注", key="pos_notes")
                 submitted = st.form_submit_button("保存持仓")
                 if submitted and shares > 0 and cost > 0:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO positions (ts_code, shares, cost_price, current_price, buy_date, notes, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (code, shares, cost, current, buy_date.strftime("%Y-%m-%d"), notes, datetime.now().isoformat())
+                    execute_sql(
+                        """INSERT INTO positions (ts_code, shares, cost_price, current_price, buy_date, notes, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (ts_code) DO UPDATE SET shares=%s, cost_price=%s, current_price=%s, buy_date=%s, notes=%s, updated_at=%s""",
+                        (code, shares, cost, current, buy_date.strftime("%Y-%m-%d"), notes, datetime.now().isoformat(),
+                         shares, cost, current, buy_date.strftime("%Y-%m-%d"), notes, datetime.now().isoformat())
                     )
-                    conn.commit()
                     st.success("持仓已保存")
                     st.rerun()
 
         st.divider()
         with st.expander("删除持仓"):
-            pos_list = query_rows("SELECT ts_code FROM positions")
-            if pos_list:
-                del_pos = st.selectbox("选择", [r[0] for r in pos_list], key="del_pos")
+            pos_list = query_df("SELECT ts_code FROM positions")
+            if len(pos_list) > 0:
+                del_pos = st.selectbox("选择", pos_list["ts_code"].tolist(), key="del_pos")
                 if st.button("清仓删除", type="secondary"):
-                    conn.execute("DELETE FROM positions WHERE ts_code=?", (del_pos,))
-                    conn.commit()
+                    execute_sql("DELETE FROM positions WHERE ts_code=%s", (del_pos,))
                     st.success("已清仓")
                     st.rerun()
 
@@ -278,12 +320,11 @@ with st.sidebar:
                 t_notes = st.text_input("备注", key="trade_notes")
                 submitted = st.form_submit_button("记录交易")
                 if submitted and t_price > 0 and t_shares > 0:
-                    conn.execute(
+                    execute_sql(
                         """INSERT INTO trades (ts_code, direction, price, shares, trade_date, fee, notes, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                         (t_code, t_dir, t_price, t_shares, t_date.strftime("%Y-%m-%d"), t_fee, t_notes, datetime.now().isoformat())
                     )
-                    conn.commit()
                     st.success("交易已记录")
                     st.rerun()
 
@@ -304,11 +345,10 @@ with st.sidebar:
                 w_notes = st.text_input("备注", key="watch_notes")
                 submitted = st.form_submit_button("添加关注")
                 if submitted:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO watchlist (ts_code, group_name, notes, added_at) VALUES (?, ?, ?, ?)",
-                        (w_code, w_group, w_notes, datetime.now().isoformat())
+                    execute_sql(
+                        "INSERT INTO watchlist (ts_code, group_name, notes, added_at) VALUES (%s, %s, %s, %s) ON CONFLICT (ts_code) DO UPDATE SET group_name=%s, notes=%s, added_at=%s",
+                        (w_code, w_group, w_notes, datetime.now().isoformat(), w_group, w_notes, datetime.now().isoformat())
                     )
-                    conn.commit()
                     st.success("已添加自选")
                     st.rerun()
 
@@ -328,13 +368,15 @@ with st.sidebar:
 # ─── 主区域：图表展示 ──────────────────────────────────
 st.title("投资仪表盘")
 
-pos_count = query_rows("SELECT COUNT(*) FROM positions")[0][0]
-trade_count = query_rows("SELECT COUNT(*) FROM trades")[0][0]
+pos_row = query_one("SELECT COUNT(*) AS cnt FROM positions")
+pos_count = pos_row["cnt"]
+trade_row = query_one("SELECT COUNT(*) AS cnt FROM trades")
+trade_count = trade_row["cnt"]
 positions = query_df("""
     SELECT p.ts_code, s.name, s.industry,
            p.shares, p.cost_price, p.current_price,
-           ROUND((p.current_price - p.cost_price) * p.shares, 2) AS profit,
-           ROUND((p.current_price - p.cost_price) / p.cost_price * 100, 2) AS profit_pct,
+           ROUND((p.current_price - p.cost_price) * p.shares::numeric, 2) AS profit,
+           ROUND((p.current_price - p.cost_price) / p.cost_price::numeric * 100, 2) AS profit_pct,
            p.buy_date, p.notes
     FROM positions p LEFT JOIN stocks s ON p.ts_code = s.ts_code
     ORDER BY profit_pct DESC
@@ -372,7 +414,7 @@ with tab_chart1:
         format_func=lambda x: f"{stocks_df[stocks_df['ts_code']==x].iloc[0]['name']} ({x})",
         key="chart1_select")
 
-    daily = query_df("SELECT * FROM daily WHERE ts_code=? ORDER BY trade_date", (selected,))
+    daily = query_df("SELECT * FROM daily WHERE ts_code=%s ORDER BY trade_date", (selected,))
     if len(daily) > 0:
         daily["date_fmt"] = pd.to_datetime(daily["trade_date"], format="%Y%m%d")
         daily = daily.sort_values("date_fmt")
@@ -441,4 +483,4 @@ with tab_chart3:
             ind_s.columns = ["行业", "股票数", "总盈亏", "平均收益率%"]
             st.dataframe(ind_s, use_container_width=True, hide_index=True)
 
-st.caption("Render 部署版 - 数据持久化存储，重启不会丢失。")
+st.caption("Supabase PostgreSQL 版 - 云端数据库，数据永久保存，重启不会丢失。")
